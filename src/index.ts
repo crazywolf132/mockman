@@ -1,0 +1,227 @@
+import * as path from 'path';
+import * as fs from 'fs-extra';
+import * as assert from 'assert';
+import * as glob from 'glob';
+import * as chokidar from 'chokidar';
+import * as bodyParser from 'body-parser';
+import * as multer from 'multer';
+import * as debounce from 'lodash.debounce';
+import analyzeDependencies from './analyzeMockDeps';
+import matchPath from './matchPath';
+
+type IIgnoreFolders = string[];
+
+const debug = require('debug')('mockman:mock');
+const chalk = require('chalk');
+
+const OPTIONAL_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
+
+const winPath = function(path) {
+    return path.replace(/\\/g, '/');
+}
+
+let error = null;
+const cwd = process.cwd();
+const mockDir = winPath(path.join(cwd, 'mock'));
+
+function getConfig(rootDir: string, ignore: IIgnoreFolders) {
+    // get mock files
+    const mockFiles = glob.sync('mock/**/*.[jt]s', {
+        cwd: rootDir,
+        ignore
+    }).map(file => path.join(rootDir, file));
+
+    const requireDeps = mockFiles.reduce((pre, curr) => {
+        return pre.concat(analyzeDependencies(curr));
+    }, []);
+    const onlySet = Array.from(new Set([...requireDeps, ...mockFiles]));
+
+    // set @babel/register for node's require
+    require('@babel/register')({
+        presets: [require.resolve('./babelPresetNode')],
+        ignore: [/node_modules/],
+        only: onlySet,
+        extensions: ['.js', '.ts'],
+        babelrc: false,
+        cache: false
+    });
+    const mockConfig = {};
+    mockFiles.forEach(mockFile => {
+        if (fs.existsSync(mockFile)) {
+            // disable require cache
+            Object.keys(require.cache).forEach(file => {
+                const winPathFile = winPath(file);
+
+                if (winPathFile === mockFile || winPathFile.indexOf(mockDir) > -1) {
+                    debug(`delete cache ${file}`);
+                    delete require.cache[file];
+                }
+            });
+            try {
+                const mockModule = require(mockFile);
+                const mockData = mockModule.default || mockModule || {};
+                Object.assign(mockConfig, mockData);
+            } catch (err) {
+                console.log(err);
+            }
+        }
+    });
+    return mockConfig;
+}
+
+const watchFiles = {};
+function logWatchFile(event, filePath) {
+    // won't log message when initialize
+    if (watchFiles[filePath]) {
+        console.log(chalk.green(event.toUpperCase()), filePath.replace(cwd, '.'));
+    } else {
+        watchFiles[filePath] = true;
+    }
+}
+
+function applyMock(app, ignore: IIgnoreFolders = []) {
+    try {
+        realApplyMock(app, ignore);
+        error = null;
+    } catch (e) {
+        console.log(e);
+        error = e;
+
+        console.log();
+        outputError();
+
+        const watcher = chokidar.watch([mockDir], {
+            ignored: /node_modules/,
+            ignoreInitial: true
+        });
+        watcher.on('all', (event, path) => {
+            logWatchFile(event, path);
+            watcher.close();
+            applyMock(app, ignore);
+        });
+    }
+}
+
+function realApplyMock(app, ignore: IIgnoreFolders) {
+    let mockConfig = [];
+
+    function parseMockConfig() {
+        const parsedMockConfig = [];
+
+        const config = getConfig(cwd, ignore);
+        Object.keys(config).forEach(key => {
+            const handler = config[key];
+            assert(
+                typeof handler === 'function' ||
+                typeof handler === 'object' ||
+                typeof handler === 'string',
+                `mock value of ${key} should be function or object or string, but got ${typeof handler}`
+            );
+
+            Array.prototype.push.apply(parsedMockConfig, parseConfig(key, handler));
+        });
+
+        return parsedMockConfig;
+    }
+
+    mockConfig = parseMockConfig();
+
+    const watcher = chokidar.watch([mockDir], {
+        ignored: /node_modules/,
+        persistent: true
+    });
+    // use debounce to avoid to much file change events
+    const updateMockConfig = debounce(() => {
+        mockConfig = parseMockConfig();
+    }, 300);
+    watcher.on('all', (event, path) => {
+        logWatchFile(event, path);
+        updateMockConfig();
+    });
+
+    app.use((req, res, next) => {
+        const match = mockConfig.length && matchPath(req, mockConfig);
+        if (match) {
+            debug(`mock matched: [${match.method}] ${match.path}`);
+            return match.handler(req, res, next);
+        } else {
+            return next();
+        }
+    });
+}
+
+function parseConfig(key, handler) {
+    let method = 'get';
+    let path = key;
+
+    if (key.indexOf(' ') > -1) {
+        const split = key.split(' ');
+        method = split[0].toLowerCase();
+        path = split[1];
+
+        return [
+            {
+                method,
+                path,
+                handler: createHandler(method, path, handler),
+                key
+            }
+        ];
+    }
+
+    return OPTIONAL_METHODS.map(method => ({
+        method,
+        path,
+        handler: createHandler(method, path, handler),
+        key
+    }));
+}
+
+const createHandler = (method, path, handler) => (req, res, next) => {
+    const bodyParserMethods = OPTIONAL_METHODS.filter(method =>  method !== 'get');
+
+    if (bodyParserMethods.includes(method)) {
+        bodyParser.json({ limit: '5mb', strict: false })(req, res, () => {
+            bodyParser.urlencoded({ limit: '5mb', extended: true })(req, res, () => {
+                sendData();
+            })
+        })
+    } else {
+        sendData();
+    }
+
+    function sendData() {
+        if (typeof handler === 'function') {
+            // deal with multi-part/form-data
+            // https://github.com/expressjs/multer/blob/master/doc/README.md
+            multer().any()(req, res, () => {
+                handler(req, res, next);
+            });
+        } else if (res.json) {
+            res.json(handler);
+        } else {
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify(handler));
+        }
+    }
+}
+
+function outputError() {
+    if (!error) return;
+
+    const filePath = error.message.split(': ')[0]
+    const relativeFilePath = filePath.replace(cwd, '.');
+    const errors = error.stack
+        .split('\n')
+        .filter(line => line.trim().indexOf('at ') !== 0)
+        .map(line => line.replace(`${filePath}: `, ''));
+    errors.splice(1, 0, ['']);
+
+    console.log(chalk.red('Failed to parse mock config.'));
+    console.log();
+    console.log(`Error in ${relativeFilePath}`);
+    console.log(errors.join('\n'));
+    console.log();
+}
+
+module.exports = applyMock;
